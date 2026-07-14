@@ -503,4 +503,15 @@ config DECK_TINYVIO
         the deck I2C bus. The deck has no 1-wire ID memory, so the driver must
         be force-loaded (set "Force load specified custom deck driver" to
         "tinyvio").
+
+config DECK_TINYVIO_VIBTEST
+    bool "TinyVIO deck: bench motor-vibration sweep"
+    depends on DECK_TINYVIO
+    default n
+    help
+        BENCH-ONLY tool: adds a `vibtest` param group + a task that spins ALL
+        FOUR MOTORS through an autonomous throttle sweep (via the motorPowerSet
+        override) while pulsing DECK_GPIO_IO1 to trigger + mark the deck's IMU
+        motor-vibration capture. The drone MUST be rigidly clamped with props on.
+        Leave OFF for any flight firmware — it commands the motors directly.
       
