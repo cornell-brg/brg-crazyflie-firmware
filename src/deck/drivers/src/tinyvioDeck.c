@@ -30,12 +30,16 @@
 #include "i2cdev.h"
 
 #include "tinyvio_deck_protocol.h"   /* vendored from the tiny-vio repo */
+#include "tinyvio_vib_protocol.h"    /* vendored — vibration bulk-read pipe   */
+#include "app_channel.h"             /* CF -> host bulk download transport    */
 
 #define DEBUG_MODULE "TINYVIO"
 #include "debug.h"
 
 #define TINYVIO_TASK_NAME        "TINYVIO"
-#define TINYVIO_TASK_STACKSIZE   (2 * configMINIMAL_STACK_SIZE)
+/* 4x minimal: the vib download's i2cdev + appchannel call chain needs the headroom
+ * (2x hardfaulted on the first 128-B window read). */
+#define TINYVIO_TASK_STACKSIZE   (4 * configMINIMAL_STACK_SIZE)
 #define TINYVIO_TASK_PRI         3
 #define TINYVIO_UPDATE_PERIOD_MS 20   /* 50 Hz — TinyMPC-class consume rate */
 
@@ -298,11 +302,122 @@ static bool tinyvioDeckTest(void) {
   return isInit;
 }
 
+/* ── Vibration blob download (radio pipe) ─────────────────────────────────────
+ * Independent of the pose protocol: pages the serialized vibration blob out of a
+ * deck running deck-imu-vib (I2C slave, tinyvio_vib_protocol.h) and forwards it
+ * to the host over the app-channel. Triggered by param `tinyvio.vibDl`. Runs
+ * blocking in tinyvioTask (post-land; a few seconds of paging). No big buffer on
+ * the CF — one 128-B window at a time, forwarded in <=26-B app-channel chunks. */
+static uint8_t  vibDl      = 0;   /* param: write 1 to start a download (auto-clear) */
+static uint8_t  vibDlDone  = 0;   /* log: 1 = last download completed OK             */
+static uint32_t vibDlBytes = 0;   /* log: bytes forwarded so far                     */
+
+static void vibForwardHeader(const tinyvio_vib_header_t *h) {
+  uint8_t p[APPCHANNEL_MTU];
+  uint8_t n = 0;
+  uint16_t v16;
+  p[n++] = TINYVIO_VIB_APP_HEADER;
+  memcpy(p + n, &h->blob_size, 4);   n += 4;
+  v16 = (uint16_t)h->n_bins;         memcpy(p + n, &v16, 2); n += 2;
+  v16 = (uint16_t)h->spec_nrows;     memcpy(p + n, &v16, 2); n += 2;
+  v16 = (uint16_t)h->spec_out_bins;  memcpy(p + n, &v16, 2); n += 2;
+  v16 = (uint16_t)h->window_n;       memcpy(p + n, &v16, 2); n += 2;
+  memcpy(p + n, &h->welch_count, 4); n += 4;
+  v16 = (uint16_t)h->odr_hz;         memcpy(p + n, &v16, 2); n += 2;
+  memcpy(p + n, &h->fs, 4);          n += 4;
+  memcpy(p + n, &h->crc32, 4);       n += 4;
+  p[n++] = h->accel_fsr_g;
+  p[n++] = h->lpf_div;
+  appchannelSendDataPacketBlock(p, n);
+}
+
+/* Buffers kept OFF the (small) tinyvioTask stack — a 128-B window + packet frame
+ * plus the nested i2cdev/appchannel call chain overflows 2*minimal stack and
+ * hardfaults the CF. Single caller (tinyvioTask), so file-scope static is safe. */
+static uint8_t s_vibWin[TINYVIO_VIB_WINDOW_SIZE];
+static uint8_t s_vibPkt[APPCHANNEL_MTU];
+
+static void vibDownloadRun(void) {
+  vibDlDone = 0;
+  vibDlBytes = 0;
+
+  /* 1. Freeze + serialize the blob on the deck. */
+  uint8_t ctl = TINYVIO_VIB_CTL_FREEZE;
+  i2cdevWriteReg8(I2C1_DEV, TINYVIO_VIB_I2C_ADDR, TINYVIO_VIB_REG_CONTROL, 1, &ctl);
+
+  /* 2. Poll the header until ready (~1 s timeout). */
+  tinyvio_vib_header_t h;
+  memset(&h, 0, sizeof(h));
+  bool ready = false;
+  for (int i = 0; i < 100 && !ready; i++) {
+    if (i2cdevReadReg8(I2C1_DEV, TINYVIO_VIB_I2C_ADDR, TINYVIO_VIB_REG_HEADER,
+                       sizeof(h), (uint8_t *)&h)
+        && h.magic == TINYVIO_VIB_MAGIC && h.ready) {
+      ready = true;
+    } else {
+      vTaskDelay(M2T(10));
+    }
+  }
+  if (!ready) { DEBUG_PRINT("vib dl: deck not ready\n"); return; }
+  if (h.blob_size == 0 || h.blob_size > 200000u) {
+    DEBUG_PRINT("vib dl: bad blob_size %lu\n", (unsigned long)h.blob_size); return;
+  }
+
+  /* 3. Header packet, then page the blob (128-B windows via BANK+WINDOW). */
+  DEBUG_PRINT("vibdl: hdr sent, blob=%lu\n", (unsigned long)h.blob_size);
+  vibForwardHeader(&h);
+  uint32_t off = 0;
+  while (off < h.blob_size) {
+    uint16_t bank = (uint16_t)(off / TINYVIO_VIB_WINDOW_SIZE);
+    uint8_t bb[2] = { (uint8_t)(bank & 0xFFu), (uint8_t)(bank >> 8) };
+    if (off == 0) DEBUG_PRINT("vibdl: A bank write\n");
+    i2cdevWriteReg8(I2C1_DEV, TINYVIO_VIB_I2C_ADDR, TINYVIO_VIB_REG_BANK, 2, bb);
+
+    uint32_t rem = h.blob_size - off;
+    uint8_t wlen = (rem < TINYVIO_VIB_WINDOW_SIZE) ? (uint8_t)rem : TINYVIO_VIB_WINDOW_SIZE;
+    if (off == 0) DEBUG_PRINT("vibdl: B win read %u\n", (unsigned)wlen);
+    if (!i2cdevReadReg8(I2C1_DEV, TINYVIO_VIB_I2C_ADDR, TINYVIO_VIB_REG_WINDOW, wlen, s_vibWin)) {
+      DEBUG_PRINT("vib dl: window read fail @%lu\n", (unsigned long)off); return;
+    }
+    if (off == 0) DEBUG_PRINT("vibdl: C win ok, sending\n");
+    for (uint32_t w = 0; w < wlen; ) {
+      uint8_t n = ((wlen - w) < TINYVIO_VIB_APP_DATA_PAYLOAD)
+                    ? (uint8_t)(wlen - w) : (uint8_t)TINYVIO_VIB_APP_DATA_PAYLOAD;
+      uint32_t poff = off + w;
+      s_vibPkt[0] = TINYVIO_VIB_APP_DATA;
+      memcpy(s_vibPkt + 1, &poff, 4);
+      memcpy(s_vibPkt + 5, s_vibWin + w, n);
+      if (off == 0 && w == 0) DEBUG_PRINT("vibdl: D first send\n");
+      appchannelSendDataPacketBlock(s_vibPkt, 5 + n);
+      if (off == 0 && w == 0) DEBUG_PRINT("vibdl: E first send ok\n");
+      w += n;
+    }
+    off += wlen;
+    vibDlBytes = off;
+  }
+
+  /* 4. Done marker (blob_size + crc for host integrity check). */
+  s_vibPkt[0] = TINYVIO_VIB_APP_DONE;
+  memcpy(s_vibPkt + 1, &h.blob_size, 4);
+  memcpy(s_vibPkt + 5, &h.crc32, 4);
+  appchannelSendDataPacketBlock(s_vibPkt, 9);
+  vibDlDone = 1;
+  DEBUG_PRINT("vib dl: %lu bytes forwarded (crc 0x%08lx)\n",
+              (unsigned long)h.blob_size, (unsigned long)h.crc32);
+}
+
 static void tinyvioTask(void *param) {
   systemWaitStart();
 
   TickType_t lastWake = xTaskGetTickCount();
   while (1) {
+    /* Vibration blob download (blocking, post-land). Runs before the pose poll. */
+    if (vibDl) {
+      vibDl = 0;
+      vibDownloadRun();
+      lastWake = xTaskGetTickCount();   /* resync after the long blocking run */
+    }
+
     bool ok = true;
 
     /* (1) Status: lifecycle + liveness. */
@@ -385,11 +500,17 @@ LOG_ADD(LOG_FLOAT, py, &py)
 LOG_ADD(LOG_FLOAT, pz, &pz)
 /** @brief Deck's echoed command-ack sequence */
 LOG_ADD(LOG_UINT8, cmdAck, &cmdAck)
+/** @brief Nonzero once the last vibration-blob download completed */
+LOG_ADD(LOG_UINT8, vibDlDone, &vibDlDone)
+/** @brief Bytes forwarded so far in the current/last vibration download */
+LOG_ADD(LOG_UINT32, vibDlBytes, &vibDlBytes)
 LOG_GROUP_STOP(tinyvio)
 
 PARAM_GROUP_START(tinyvio)
 /** @brief Write a TINYVIO_CMD_* value to issue that command to the deck once */
 PARAM_ADD(PARAM_UINT8, cmd, &reqCmd)
+/** @brief Write 1 to download the deck's vibration blob to the host (app-channel) */
+PARAM_ADD(PARAM_UINT8, vibDl, &vibDl)
 PARAM_GROUP_STOP(tinyvio)
 
 #ifdef CONFIG_DECK_TINYVIO_VIBTEST
