@@ -48,7 +48,7 @@ We added the following:
 // firmware as the only instance and in bindings
 // to hold the default values
 static controllerMellinger_t g_self = {
-  .mass = CF_MASS,
+  .mass = 0.031f,   // 27 g CF + 4 g tinyvio deck (was CF_MASS = 0.027)
   .massThrust = 132000,
 
   // XY Position PID
