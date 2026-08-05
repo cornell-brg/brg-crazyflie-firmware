@@ -14,8 +14,15 @@
  *       [*] Support the TinyVIO deck          (CONFIG_DECK_TINYVIO=y)
  *       Force load specified custom deck driver = "tinyvio"  (CONFIG_DECK_FORCE)
  *
- * cfclient: log group `tinyvio` (i2cOk, state, px/py/pz, quality, alive, coherent);
- * param group `tinyvio` (cmd -> issues a TINYVIO_CMD_* to the deck).
+ * v0x02 protocol (spec: research-vault tiny-cvio/deck-comms-protocol.md):
+ *   LOG  `tinyvio`  — pose (px/py/pz), est-FSM state, fault byte, TELEM decode
+ *                     (stdPos/stdAtt/bg/ba, fold pair), capture state, download
+ *                     progress. ROS selects fields+rate via LogConfig.
+ *   PARAM `tinyvio` — est commands (cmd) + capture commands (capCmd/capType/
+ *                     capLabel/capOdr/capLpf/capFsr, relayed to CAPTURE_CTRL)
+ *                     + capDl (page the READY blob out over the app-channel).
+ * Capability-gated: IDENTITY.capabilities decides whether CAPTURE/TELEM blocks
+ * are polled, so one driver serves every deck app (pose, vib, future).
  */
 
 #include <string.h>
@@ -29,8 +36,7 @@
 #include "param.h"
 #include "i2cdev.h"
 
-#include "tinyvio_deck_protocol.h"   /* vendored from the tiny-vio repo */
-#include "tinyvio_vib_protocol.h"    /* vendored — vibration bulk-read pipe   */
+#include "tinyvio_deck_protocol.h"   /* vendored from the tiny-vio repo (v0x02) */
 #include "app_channel.h"             /* CF -> host bulk download transport    */
 
 #define DEBUG_MODULE "TINYVIO"
@@ -45,15 +51,25 @@
 
 static bool isInit = false;
 static bool isVerified = false;
+static uint8_t deckCaps = 0;      /* IDENTITY.capabilities, cached at init        */
 
 /* Telemetry (LOG) */
 static uint8_t  i2cOk = 0;        /* last poll fully ACKed                        */
 static uint8_t  state = 0;        /* deck lifecycle (tinyvio_state_t)             */
-static uint8_t  quality = 0;      /* tracking confidence 0..255                   */
+static uint8_t  fault = 0;        /* Vitals estimator fault byte (0 = healthy)    */
 static uint8_t  coherent = 0;     /* last DATA read passed the seqlock            */
 static uint8_t  aliveOk = 0;      /* deck alive_counter is advancing              */
 static float    px = 0, py = 0, pz = 0;  /* position estimate (m)                 */
 static uint32_t lastAlive = 0;
+
+/* TELEM block decode (LOG floats; only polled when deck has CAP_TELEM) */
+static float    stdPosX = 0, stdPosY = 0, stdPosZ = 0;  /* σ position (m)         */
+static float    stdAttX = 0, stdAttY = 0, stdAttZ = 0;  /* σ attitude (rad)       */
+static float    bgX = 0, bgY = 0, bgZ = 0;              /* gyro bias (rad/s)      */
+static float    baX = 0, baY = 0, baZ = 0;              /* accel bias (m/s²)      */
+static uint8_t  nFolded = 0, nAccepted = 0;             /* fold starvation pair   */
+static uint16_t updateUs = 0;
+static uint8_t  clones = 0;
 
 /* Command channel (PARAM): set `cmd` to a TINYVIO_CMD_* to issue it once. */
 static uint8_t reqCmd = 0;
@@ -61,7 +77,25 @@ static uint8_t lastReqCmd = 0;
 static uint8_t cmdSeq = 0;
 static uint8_t cmdAck = 0;
 
+/* Capture command channel (PARAM → CAPTURE_CTRL relay; only with CAP_CAPTURE).
+ * Host sets capType/capLabel/capOdr/capLpf/capFsr, then writes capCmd (a
+ * TINYVIO_CAP_CMD_*) — relayed once with a fresh seq, then auto-cleared. */
+static uint8_t  capCmd = 0;       /* param trigger (auto-clears)                  */
+static uint8_t  capType = TINYVIO_CAP_TYPE_VIB;
+static uint16_t capLabel = 0;
+static uint8_t  capOdr = 0;       /* tinyvio_odr_code_t; 0 = keep                 */
+static uint8_t  capLpf = 0;       /* UI-LPF divisor; 0 = NO_FILTER                */
+static uint8_t  capFsr = 0;       /* accel FSR g; 0 = keep                        */
+static uint8_t  capCmdSeq = 0;    /* local seq, mirrors deck's ack               */
+/* Capture status mirror (LOG) */
+static uint8_t  capState = 0;     /* tinyvio_cap_state_t                          */
+static uint8_t  capStatus = 0;    /* tinyvio_cap_cmd_status_t of last command     */
+static uint8_t  capAck = 0;       /* deck's cap_cmd_ack_seq                       */
+static uint32_t capBlobSz = 0;
+static uint16_t capCount = 0;     /* live progress (advisory)                     */
+
 static void tinyvioTask(void *param);
+static void probeIdentity(void);
 
 #ifdef CONFIG_DECK_TINYVIO_VIBTEST
 /* ───────────────────────── Bench vibration-test sequencer ─────────────────
@@ -274,14 +308,7 @@ static void tinyvioDeckInit(DeckInfo *info) {
     return;
   }
 
-  tinyvio_identity_t id;
-  memset(&id, 0, sizeof(id));
-  bool ok = i2cdevReadReg8(I2C1_DEV, TINYVIO_I2C_ADDR, TINYVIO_REG_IDENTITY,
-                           sizeof(id), (uint8_t *)&id);
-  isVerified = ok && tinyvio_identity_ok(&id);
-  DEBUG_PRINT("TinyVIO deck: ok=%d magic=0x%04x who=0x%02x proto=%u caps=0x%02x -> %s\n",
-              (int)ok, id.magic, id.who_am_i, id.proto_version, id.capabilities,
-              isVerified ? "verified" : "unverified (non-fatal, task keeps polling)");
+  probeIdentity();   /* non-fatal on failure: the task retries until verified */
 
   xTaskCreate(tinyvioTask, TINYVIO_TASK_NAME, TINYVIO_TASK_STACKSIZE,
               NULL, TINYVIO_TASK_PRI, NULL);
@@ -302,131 +329,146 @@ static bool tinyvioDeckTest(void) {
   return isInit;
 }
 
-/* ── Vibration blob download (radio pipe) ─────────────────────────────────────
- * Independent of the pose protocol: pages the serialized vibration blob out of a
- * deck running deck-imu-vib (I2C slave, tinyvio_vib_protocol.h) and forwards it
- * to the host over the app-channel. Triggered by param `tinyvio.vibDl`. Runs
- * blocking in tinyvioTask (post-land; a few seconds of paging). No big buffer on
- * the CF — one 128-B window at a time, forwarded in <=26-B app-channel chunks. */
-static uint8_t  vibDl      = 0;   /* param: write 1 to start a download (auto-clear) */
-static uint8_t  vibDlDone  = 0;   /* log: 1 = last download completed OK             */
-static uint32_t vibDlBytes = 0;   /* log: bytes forwarded so far                     */
-
-static void vibForwardHeader(const tinyvio_vib_header_t *h) {
-  uint8_t p[APPCHANNEL_MTU];
-  uint8_t n = 0;
-  uint16_t v16;
-  p[n++] = TINYVIO_VIB_APP_HEADER;
-  memcpy(p + n, &h->blob_size, 4);   n += 4;
-  v16 = (uint16_t)h->n_bins;         memcpy(p + n, &v16, 2); n += 2;
-  v16 = (uint16_t)h->spec_nrows;     memcpy(p + n, &v16, 2); n += 2;
-  v16 = (uint16_t)h->spec_out_bins;  memcpy(p + n, &v16, 2); n += 2;
-  v16 = (uint16_t)h->window_n;       memcpy(p + n, &v16, 2); n += 2;
-  memcpy(p + n, &h->welch_count, 4); n += 4;
-  v16 = (uint16_t)h->odr_hz;         memcpy(p + n, &v16, 2); n += 2;
-  memcpy(p + n, &h->fs, 4);          n += 4;
-  memcpy(p + n, &h->crc32, 4);       n += 4;
-  p[n++] = h->accel_fsr_g;
-  p[n++] = h->lpf_div;
-  appchannelSendDataPacketBlock(p, n);
+/* Probe + verify the deck identity; on success cache capabilities and seed the
+ * capture-command seq from the deck's last ack. Called at init AND retried from
+ * the task until verified — a lost power-on race must not permanently disable
+ * the capture path (review MAJOR-4). Seeding capCmdSeq from cap_cmd_ack_seq
+ * prevents seq aliasing after a CF reboot: our first command's seq is then
+ * guaranteed != the deck's persisted last seq (review MAJOR-5). */
+static void probeIdentity(void) {
+  tinyvio_identity_t id;
+  memset(&id, 0, sizeof(id));
+  bool ok = i2cdevReadReg8(I2C1_DEV, TINYVIO_I2C_ADDR, TINYVIO_REG_IDENTITY,
+                           sizeof(id), (uint8_t *)&id);
+  isVerified = ok && tinyvio_identity_ok(&id);
+  deckCaps = isVerified ? id.capabilities : 0;   /* gates CAPTURE/TELEM polling */
+  DEBUG_PRINT("TinyVIO deck: ok=%d magic=0x%04x who=0x%02x proto=%u caps=0x%02x -> %s\n",
+              (int)ok, id.magic, id.who_am_i, id.proto_version, id.capabilities,
+              isVerified ? "verified" : "unverified (will retry)");
+  if (isVerified && (deckCaps & TINYVIO_CAP_CAPTURE)) {
+    tinyvio_capture_ctrl_t cc;
+    if (i2cdevReadReg8(I2C1_DEV, TINYVIO_I2C_ADDR, TINYVIO_REG_CAPTURE_CTRL,
+                       sizeof(cc), (uint8_t *)&cc)) {
+      capCmdSeq = cc.cap_cmd_ack_seq;   /* next command = ack+1, never aliases */
+    }
+  }
 }
 
-/* Buffers kept OFF the (small) tinyvioTask stack — a 128-B window + packet frame
- * plus the nested i2cdev/appchannel call chain overflows 2*minimal stack and
- * hardfaults the CF. Single caller (tinyvioTask), so file-scope static is safe. */
-static uint8_t s_vibWin[TINYVIO_VIB_WINDOW_SIZE];
-static uint8_t s_vibPkt[APPCHANNEL_MTU];
+/* ── Capture blob download (v0x02, generalized over capture types) ────────────
+ * Pages the READY blob out of the deck's WINDOW and forwards it to the host on
+ * the app-channel. Param `tinyvio.capDl`; blocking in tinyvioTask (post-land or
+ * landed-between-tests). Download does NOT change deck state — the host sends
+ * capCmd = RELEASE after CRC-verifying. Blobs are self-describing (type header
+ * leads the blob), so this code is type-agnostic.
+ * ⚠ Every app-channel packet MUST be ≤ 30 B: APPCHANNEL_MTU claims 31 but
+ * crtpSendPacketBlock ASSERTs (and reboots the CF) above CRTP_MAX_DATA_SIZE=30.
+ * TINYVIO_APP_DATA_PAYLOAD (25) encodes that cap. */
+static uint8_t  capDl      = 0;   /* param: write 1 to start a download (auto-clear) */
+static uint8_t  capDlDone  = 0;   /* log: 1 = last download completed OK             */
+static uint32_t capDlBytes = 0;   /* log: bytes forwarded so far                     */
 
-static void vibDownloadRun(void) {
-  vibDlDone = 0;
-  vibDlBytes = 0;
+/* Buffers kept OFF the (small) tinyvioTask stack — a window + packet frame plus
+ * the nested i2cdev/appchannel call chain overflowed 2x-minimal stack once
+ * (hardfault). Single caller (tinyvioTask), so file-scope static is safe. */
+static uint8_t s_capWin[TINYVIO_WINDOW_SIZE];
+static uint8_t s_capPkt[30];      /* the CRTP hard cap */
 
-  /* 1. Freeze + serialize the blob on the deck. */
-  uint8_t ctl = TINYVIO_VIB_CTL_FREEZE;
-  i2cdevWriteReg8(I2C1_DEV, TINYVIO_VIB_I2C_ADDR, TINYVIO_VIB_REG_CONTROL, 1, &ctl);
+static void capDownloadRun(void) {
+  capDlDone = 0;
+  capDlBytes = 0;
 
-  /* 2. Poll the header until ready (~1 s timeout). */
-  tinyvio_vib_header_t h;
-  memset(&h, 0, sizeof(h));
-  bool ready = false;
-  for (int i = 0; i < 100 && !ready; i++) {
-    if (i2cdevReadReg8(I2C1_DEV, TINYVIO_VIB_I2C_ADDR, TINYVIO_VIB_REG_HEADER,
-                       sizeof(h), (uint8_t *)&h)
-        && h.magic == TINYVIO_VIB_MAGIC && h.ready) {
-      ready = true;
-    } else {
-      vTaskDelay(M2T(10));
-    }
+  /* 1. The capture must already be frozen: cap_state == READY (host sent STOP). */
+  tinyvio_capture_stat_t cs;
+  memset(&cs, 0, sizeof(cs));
+  if (!i2cdevReadReg8(I2C1_DEV, TINYVIO_I2C_ADDR, TINYVIO_REG_CAPTURE_STAT,
+                      sizeof(cs), (uint8_t *)&cs) ||
+      cs.cap_state != TINYVIO_CAP_READY) {
+    DEBUG_PRINT("cap dl: not READY (state=%u)\n", (unsigned)cs.cap_state);
+    return;
   }
-  if (!ready) { DEBUG_PRINT("vib dl: deck not ready\n"); return; }
-  if (h.blob_size == 0 || h.blob_size > 200000u) {
-    DEBUG_PRINT("vib dl: bad blob_size %lu\n", (unsigned long)h.blob_size); return;
+  if (cs.blob_size == 0u || cs.blob_size > 200000u) {
+    DEBUG_PRINT("cap dl: bad blob_size %lu\n", (unsigned long)cs.blob_size);
+    return;
   }
 
-  /* 3. Header packet, then page the blob (128-B windows via BANK+WINDOW). */
-  DEBUG_PRINT("vibdl: hdr sent, blob=%lu\n", (unsigned long)h.blob_size);
-  vibForwardHeader(&h);
+  /* 2. Generic 'H': [u8 'H'][u8 type][u16 label][u32 blob_size][u32 crc32]. */
+  s_capPkt[0] = TINYVIO_APP_HEADER;
+  s_capPkt[1] = cs.cap_type;
+  memcpy(s_capPkt + 2,  &cs.cap_label, 2);
+  memcpy(s_capPkt + 4,  &cs.blob_size, 4);
+  memcpy(s_capPkt + 8,  &cs.crc32,     4);
+  appchannelSendDataPacketBlock(s_capPkt, 12);
+
+  /* 3. Page: select a 64-B bank (cap_bank in CAPTURE_CTRL), burst-read WINDOW,
+   * forward as 'D' [u8 'D'][u32 offset][<=25 B] chunks, reassembled by offset. */
   uint32_t off = 0;
-  while (off < h.blob_size) {
-    uint16_t bank = (uint16_t)(off / TINYVIO_VIB_WINDOW_SIZE);
+  while (off < cs.blob_size) {
+    uint16_t bank = (uint16_t)(off / TINYVIO_WINDOW_SIZE);
     uint8_t bb[2] = { (uint8_t)(bank & 0xFFu), (uint8_t)(bank >> 8) };
-    if (off == 0) DEBUG_PRINT("vibdl: A bank write\n");
-    i2cdevWriteReg8(I2C1_DEV, TINYVIO_VIB_I2C_ADDR, TINYVIO_VIB_REG_BANK, 2, bb);
+    i2cdevWriteReg8(I2C1_DEV, TINYVIO_I2C_ADDR,
+                    TINYVIO_REG_CAPTURE_CTRL + offsetof(tinyvio_capture_ctrl_t, cap_bank),
+                    2, bb);
 
-    uint32_t rem = h.blob_size - off;
-    uint8_t wlen = (rem < TINYVIO_VIB_WINDOW_SIZE) ? (uint8_t)rem : TINYVIO_VIB_WINDOW_SIZE;
-    if (off == 0) DEBUG_PRINT("vibdl: B win read %u\n", (unsigned)wlen);
-    if (!i2cdevReadReg8(I2C1_DEV, TINYVIO_VIB_I2C_ADDR, TINYVIO_VIB_REG_WINDOW, wlen, s_vibWin)) {
-      DEBUG_PRINT("vib dl: window read fail @%lu\n", (unsigned long)off); return;
+    uint32_t rem = cs.blob_size - off;
+    uint8_t wlen = (rem < TINYVIO_WINDOW_SIZE) ? (uint8_t)rem : (uint8_t)TINYVIO_WINDOW_SIZE;
+    if (!i2cdevReadReg8(I2C1_DEV, TINYVIO_I2C_ADDR, TINYVIO_REG_WINDOW, wlen, s_capWin)) {
+      DEBUG_PRINT("cap dl: window read fail @%lu\n", (unsigned long)off);
+      return;
     }
-    if (off == 0) DEBUG_PRINT("vibdl: C win ok, sending\n");
     for (uint32_t w = 0; w < wlen; ) {
-      uint8_t n = ((wlen - w) < TINYVIO_VIB_APP_DATA_PAYLOAD)
-                    ? (uint8_t)(wlen - w) : (uint8_t)TINYVIO_VIB_APP_DATA_PAYLOAD;
+      uint8_t n = ((wlen - w) < TINYVIO_APP_DATA_PAYLOAD)
+                    ? (uint8_t)(wlen - w) : (uint8_t)TINYVIO_APP_DATA_PAYLOAD;
       uint32_t poff = off + w;
-      s_vibPkt[0] = TINYVIO_VIB_APP_DATA;
-      memcpy(s_vibPkt + 1, &poff, 4);
-      memcpy(s_vibPkt + 5, s_vibWin + w, n);
-      if (off == 0 && w == 0) DEBUG_PRINT("vibdl: D first send\n");
-      appchannelSendDataPacketBlock(s_vibPkt, 5 + n);
-      if (off == 0 && w == 0) DEBUG_PRINT("vibdl: E first send ok\n");
+      s_capPkt[0] = TINYVIO_APP_DATA;
+      memcpy(s_capPkt + 1, &poff, 4);
+      memcpy(s_capPkt + 5, s_capWin + w, n);
+      appchannelSendDataPacketBlock(s_capPkt, 5 + n);
       w += n;
     }
     off += wlen;
-    vibDlBytes = off;
+    capDlBytes = off;
   }
 
-  /* 4. Done marker (blob_size + crc for host integrity check). */
-  s_vibPkt[0] = TINYVIO_VIB_APP_DONE;
-  memcpy(s_vibPkt + 1, &h.blob_size, 4);
-  memcpy(s_vibPkt + 5, &h.crc32, 4);
-  appchannelSendDataPacketBlock(s_vibPkt, 9);
-  vibDlDone = 1;
-  DEBUG_PRINT("vib dl: %lu bytes forwarded (crc 0x%08lx)\n",
-              (unsigned long)h.blob_size, (unsigned long)h.crc32);
+  /* 4. 'E' done marker: [u8 'E'][u32 blob_size][u32 crc32]. */
+  s_capPkt[0] = TINYVIO_APP_DONE;
+  memcpy(s_capPkt + 1, &cs.blob_size, 4);
+  memcpy(s_capPkt + 5, &cs.crc32,     4);
+  appchannelSendDataPacketBlock(s_capPkt, 9);
+  capDlDone = 1;
+  DEBUG_PRINT("cap dl: type %u, %lu B forwarded (crc 0x%08lx)\n",
+              (unsigned)cs.cap_type, (unsigned long)cs.blob_size,
+              (unsigned long)cs.crc32);
 }
 
 static void tinyvioTask(void *param) {
   systemWaitStart();
 
   TickType_t lastWake = xTaskGetTickCount();
+  uint32_t cycle = 0;
   while (1) {
-    /* Vibration blob download (blocking, post-land). Runs before the pose poll. */
-    if (vibDl) {
-      vibDl = 0;
-      vibDownloadRun();
+    cycle++;
+    /* Identity retry: a lost power-on race must not leave the deck unverified
+     * (and the capture path dead) until a CF reboot. Re-probe at 1 Hz. */
+    if (!isVerified && (cycle % 50u) == 0u) {
+      probeIdentity();
+    }
+
+    /* Capture blob download (blocking, landed). Runs before the poll cycle. */
+    if (capDl) {
+      capDl = 0;
+      if (deckCaps & TINYVIO_CAP_CAPTURE) capDownloadRun();
       lastWake = xTaskGetTickCount();   /* resync after the long blocking run */
     }
 
     bool ok = true;
 
-    /* (1) Status: lifecycle + liveness. */
+    /* (1) Status: lifecycle + liveness + estimator fault byte. */
     tinyvio_status_t st;
     ok &= i2cdevReadReg8(I2C1_DEV, TINYVIO_I2C_ADDR, TINYVIO_REG_STATUS,
                          sizeof(st), (uint8_t *)&st);
     if (ok) {
       state    = st.state;
-      quality  = st.track_quality;
+      fault    = st.fault;
       aliveOk  = (st.alive_counter != lastAlive) ? 1 : 0;   /* stalled deck -> 0 */
       lastAlive = st.alive_counter;
     }
@@ -447,7 +489,7 @@ static void tinyvioTask(void *param) {
       px = d.pos[0]; py = d.pos[1]; pz = d.pos[2];
     }
 
-    /* (3) Command channel: issue a new command once, then read back the ack. */
+    /* (3) Estimator command channel: issue once, read back the ack. */
     if (reqCmd != lastReqCmd) {
       cmdSeq++;
       uint8_t cbuf[2] = { reqCmd, cmdSeq };   /* control.cmd, control.cmd_seq */
@@ -457,6 +499,68 @@ static void tinyvioTask(void *param) {
     ok &= i2cdevReadByte(I2C1_DEV, TINYVIO_I2C_ADDR,
                          TINYVIO_REG_CONTROL + offsetof(tinyvio_control_t, cmd_ack_seq),
                          &cmdAck);
+
+    /* (4) Capture command relay + status mirror (only with CAP_CAPTURE). */
+    if (deckCaps & TINYVIO_CAP_CAPTURE) {
+      if (capCmd != TINYVIO_CAP_CMD_NONE) {
+        /* Two-write order: config bytes FIRST (odr/lpf/fsr @ +0x0A..0x0C), then
+         * cmd/type/label/seq (@ +0x00..0x04) as one burst ENDING with the fresh
+         * seq — the deck processes on seq change, so the command becomes visible
+         * only after its config is already in place. */
+        capCmdSeq++;
+        uint8_t cfg[3] = { capOdr, capLpf, capFsr };
+        ok &= i2cdevWriteReg8(I2C1_DEV, TINYVIO_I2C_ADDR,
+                              TINYVIO_REG_CAPTURE_CTRL +
+                              offsetof(tinyvio_capture_ctrl_t, cap_odr_code),
+                              3, cfg);
+        uint8_t cmdb[5];
+        cmdb[0] = capCmd;
+        cmdb[1] = capType;
+        memcpy(cmdb + 2, &capLabel, 2);
+        cmdb[4] = capCmdSeq;
+        ok &= i2cdevWriteReg8(I2C1_DEV, TINYVIO_I2C_ADDR,
+                              TINYVIO_REG_CAPTURE_CTRL, 5, cmdb);
+        capCmd = 0;   /* auto-clearing trigger (vibtest.startTest idiom) */
+      }
+      /* Mirror ack/status + capture state for LOG (each 20 ms cycle). */
+      tinyvio_capture_ctrl_t cc;
+      if (i2cdevReadReg8(I2C1_DEV, TINYVIO_I2C_ADDR, TINYVIO_REG_CAPTURE_CTRL,
+                         sizeof(cc), (uint8_t *)&cc)) {
+        capAck    = cc.cap_cmd_ack_seq;
+        capStatus = cc.cap_cmd_status;
+      }
+      tinyvio_capture_stat_t cs;
+      if (i2cdevReadReg8(I2C1_DEV, TINYVIO_I2C_ADDR, TINYVIO_REG_CAPTURE_STAT,
+                         sizeof(cs), (uint8_t *)&cs)) {
+        capState  = cs.cap_state;
+        capBlobSz = cs.blob_size;
+        capCount  = cs.cap_count;
+      }
+    }
+
+    /* (5) TELEM decode → LOG floats (only with CAP_TELEM; advisory block). */
+    if (deckCaps & TINYVIO_CAP_TELEM) {
+      tinyvio_telem_t tm;
+      if (i2cdevReadReg8(I2C1_DEV, TINYVIO_I2C_ADDR, TINYVIO_REG_TELEM,
+                         sizeof(tm), (uint8_t *)&tm)) {
+        stdPosX = tinyvio_telem_dec(tm.std_pos[0], TINYVIO_TELEM_STDPOS_LSB_M);
+        stdPosY = tinyvio_telem_dec(tm.std_pos[1], TINYVIO_TELEM_STDPOS_LSB_M);
+        stdPosZ = tinyvio_telem_dec(tm.std_pos[2], TINYVIO_TELEM_STDPOS_LSB_M);
+        stdAttX = tinyvio_telem_dec(tm.std_att[0], TINYVIO_TELEM_STDATT_LSB_RAD);
+        stdAttY = tinyvio_telem_dec(tm.std_att[1], TINYVIO_TELEM_STDATT_LSB_RAD);
+        stdAttZ = tinyvio_telem_dec(tm.std_att[2], TINYVIO_TELEM_STDATT_LSB_RAD);
+        bgX = tinyvio_telem_dec(tm.bg[0], TINYVIO_TELEM_BG_LSB_RADS);
+        bgY = tinyvio_telem_dec(tm.bg[1], TINYVIO_TELEM_BG_LSB_RADS);
+        bgZ = tinyvio_telem_dec(tm.bg[2], TINYVIO_TELEM_BG_LSB_RADS);
+        baX = tinyvio_telem_dec(tm.ba[0], TINYVIO_TELEM_BA_LSB_MS2);
+        baY = tinyvio_telem_dec(tm.ba[1], TINYVIO_TELEM_BA_LSB_MS2);
+        baZ = tinyvio_telem_dec(tm.ba[2], TINYVIO_TELEM_BA_LSB_MS2);
+        nFolded   = tm.n_folded;
+        nAccepted = tm.n_accepted;
+        updateUs  = tm.update_us;
+        clones    = tm.clones;
+      }
+    }
 
     i2cOk = ok ? 1 : 0;
     vTaskDelayUntil(&lastWake, M2T(TINYVIO_UPDATE_PERIOD_MS));
@@ -490,27 +594,73 @@ LOG_ADD(LOG_UINT8, state, &state)
 LOG_ADD(LOG_UINT8, coherent, &coherent)
 /** @brief Nonzero if the deck's alive_counter is advancing */
 LOG_ADD(LOG_UINT8, aliveOk, &aliveOk)
-/** @brief Tracking confidence 0..255 */
-LOG_ADD(LOG_UINT8, quality, &quality)
+/** @brief Vitals estimator fault byte (0 = healthy; bits per vitals.h) */
+LOG_ADD(LOG_UINT8, fault, &fault)
 /** @brief Position estimate x (m, deck odometry frame) */
 LOG_ADD(LOG_FLOAT, px, &px)
 /** @brief Position estimate y (m, deck odometry frame) */
 LOG_ADD(LOG_FLOAT, py, &py)
 /** @brief Position estimate z (m, deck odometry frame) */
 LOG_ADD(LOG_FLOAT, pz, &pz)
-/** @brief Deck's echoed command-ack sequence */
+/** @brief Deck's echoed estimator command-ack sequence */
 LOG_ADD(LOG_UINT8, cmdAck, &cmdAck)
-/** @brief Nonzero once the last vibration-blob download completed */
-LOG_ADD(LOG_UINT8, vibDlDone, &vibDlDone)
-/** @brief Bytes forwarded so far in the current/last vibration download */
-LOG_ADD(LOG_UINT32, vibDlBytes, &vibDlBytes)
+/** @brief Capture FSM state (0 idle / 1 capturing / 2 ready) */
+LOG_ADD(LOG_UINT8, capState, &capState)
+/** @brief Result of the last capture command (tinyvio_cap_cmd_status_t) */
+LOG_ADD(LOG_UINT8, capStatus, &capStatus)
+/** @brief Deck's echoed capture command-ack sequence */
+LOG_ADD(LOG_UINT8, capAck, &capAck)
+/** @brief Size of the READY capture blob (bytes) */
+LOG_ADD(LOG_UINT32, capBlobSz, &capBlobSz)
+/** @brief Live capture progress (e.g. Welch windows; advisory) */
+LOG_ADD(LOG_UINT16, capCount, &capCount)
+/** @brief Nonzero once the last capture download completed */
+LOG_ADD(LOG_UINT8, capDlDone, &capDlDone)
+/** @brief Bytes forwarded so far in the current/last capture download */
+LOG_ADD(LOG_UINT32, capDlBytes, &capDlBytes)
+/** @brief Position std-dev x/y/z (m, from the deck TELEM block) */
+LOG_ADD(LOG_FLOAT, stdPosX, &stdPosX)
+LOG_ADD(LOG_FLOAT, stdPosY, &stdPosY)
+LOG_ADD(LOG_FLOAT, stdPosZ, &stdPosZ)
+/** @brief Attitude std-dev x/y/z (rad) */
+LOG_ADD(LOG_FLOAT, stdAttX, &stdAttX)
+LOG_ADD(LOG_FLOAT, stdAttY, &stdAttY)
+LOG_ADD(LOG_FLOAT, stdAttZ, &stdAttZ)
+/** @brief Gyro bias estimate x/y/z (rad/s) */
+LOG_ADD(LOG_FLOAT, bgX, &bgX)
+LOG_ADD(LOG_FLOAT, bgY, &bgY)
+LOG_ADD(LOG_FLOAT, bgZ, &bgZ)
+/** @brief Accel bias estimate x/y/z (m/s^2) */
+LOG_ADD(LOG_FLOAT, baX, &baX)
+LOG_ADD(LOG_FLOAT, baY, &baY)
+LOG_ADD(LOG_FLOAT, baZ, &baZ)
+/** @brief Board folds selected this frame */
+LOG_ADD(LOG_UINT8, nFolded, &nFolded)
+/** @brief Board folds accepted this frame (starvation pair with nFolded) */
+LOG_ADD(LOG_UINT8, nAccepted, &nAccepted)
+/** @brief EKF update latency (us) */
+LOG_ADD(LOG_UINT16, updateUs, &updateUs)
+/** @brief Live clone count */
+LOG_ADD(LOG_UINT8, clones, &clones)
 LOG_GROUP_STOP(tinyvio)
 
 PARAM_GROUP_START(tinyvio)
 /** @brief Write a TINYVIO_CMD_* value to issue that command to the deck once */
 PARAM_ADD(PARAM_UINT8, cmd, &reqCmd)
-/** @brief Write 1 to download the deck's vibration blob to the host (app-channel) */
-PARAM_ADD(PARAM_UINT8, vibDl, &vibDl)
+/** @brief Capture command: write a TINYVIO_CAP_CMD_* to relay it once (auto-clears) */
+PARAM_ADD(PARAM_UINT8, capCmd, &capCmd)
+/** @brief Capture type for START (tinyvio_cap_type_t; 1 = VIB) */
+PARAM_ADD(PARAM_UINT8, capType, &capType)
+/** @brief Test label baked into the capture (u16) */
+PARAM_ADD(PARAM_UINT16, capLabel, &capLabel)
+/** @brief IMU ODR code for START (tinyvio_odr_code_t; 0 = keep) */
+PARAM_ADD(PARAM_UINT8, capOdr, &capOdr)
+/** @brief IMU UI-LPF divisor for START (0 = NO_FILTER, 4/8/16/32/64/128) */
+PARAM_ADD(PARAM_UINT8, capLpf, &capLpf)
+/** @brief Accel FSR (g) for START (0 = keep, 2/4/8/16/32) */
+PARAM_ADD(PARAM_UINT8, capFsr, &capFsr)
+/** @brief Write 1 to page the READY capture blob to the host (app-channel) */
+PARAM_ADD(PARAM_UINT8, capDl, &capDl)
 PARAM_GROUP_STOP(tinyvio)
 
 #ifdef CONFIG_DECK_TINYVIO_VIBTEST
