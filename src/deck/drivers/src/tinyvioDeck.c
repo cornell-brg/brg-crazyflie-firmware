@@ -60,7 +60,11 @@ static uint8_t  fault = 0;        /* Vitals estimator fault byte (0 = healthy)  
 static uint8_t  coherent = 0;     /* last DATA read passed the seqlock            */
 static uint8_t  aliveOk = 0;      /* deck alive_counter is advancing              */
 static float    px = 0, py = 0, pz = 0;  /* position estimate (m)                 */
-static uint32_t tUs = 0;          /* deck time-of-validity for px/py/pz (us, low 32) */
+/* Deck time-of-validity for px/py/pz, split into halves: LogDataGeneric carries
+ * values as float32, whose 24-bit mantissa would quantise a u32 us count to
+ * ~256 us. Each u16 is exactly representable, so the host gets exact us back
+ * via (hi << 16) | lo. */
+static uint16_t tUsHi = 0, tUsLo = 0;
 static uint32_t lastAlive = 0;
 
 /* TELEM block decode (LOG floats; only polled when deck has CAP_TELEM) */
@@ -284,9 +288,11 @@ static void tinyvioTask(void *param) {
        * (when WE sampled, up to TINYVIO_UPDATE_PERIOD_MS late) and the ROS
        * receive time (later still, and jittery) — neither says when the deck
        * believed this pose was true. Assigned inside the coherence gate so the
-       * stamp can never be paired with a pose from a different frame.
-       * Low 32 bits only: LOG has no u64, and the wrap is ~71.6 min. */
-      tUs = (uint32_t)d.timestamp_us;
+       * stamp cannot be paired with a pose from a different frame.
+       * Low 32 bits only: the wrap is ~71.6 min. */
+      const uint32_t t32 = (uint32_t)d.timestamp_us;
+      tUsLo = (uint16_t)(t32 & 0xFFFFu);
+      tUsHi = (uint16_t)(t32 >> 16);
     }
 
     /* (3) Estimator command channel: issue once, read back the ack. */
@@ -397,17 +403,13 @@ LOG_ADD(LOG_FLOAT, px, &px)
 LOG_ADD(LOG_FLOAT, py, &py)
 /** @brief Position estimate z (m, deck odometry frame) */
 LOG_ADD(LOG_FLOAT, pz, &pz)
-/** @brief Deck time-of-validity for px/py/pz (deck us, low 32 bits; wraps ~71.6 min).
- *  Log it in the SAME block as px/py/pz — that pairs each pose with the instant the
- *  deck says it was true, instead of the instant the STM32 happened to sample it.
- *
- *  @warning QUANTIZED DOWNSTREAM. crazyswarm2's LogDataGeneric carries values as
- *  float32[], so this u32 is float-converted on the way to ROS. A float32 holds 24
- *  mantissa bits, so a microsecond count loses resolution as it grows: ~64 us at
- *  18 min of deck uptime, 256 us at the 71 min wrap. Harmless here (the driver's
- *  own 20 ms poll is ~80x coarser) but do NOT treat this as us-exact, and do not
- *  reuse this variable for anything needing sub-100-us truth. */
-LOG_ADD(LOG_UINT32, tUs, &tUs)
+/** @brief Deck time-of-validity, high half. Reassemble host-side:
+ *  t_us = (tUsHi << 16) | tUsLo   (deck us, low 32 bits; wraps ~71.6 min).
+ *  Log both halves in the SAME block as px/py/pz — that pairs each pose with the
+ *  instant the deck says it was true, not the instant the STM32 sampled it. */
+LOG_ADD(LOG_UINT16, tUsHi, &tUsHi)
+/** @brief Deck time-of-validity, low half. See tUsHi. */
+LOG_ADD(LOG_UINT16, tUsLo, &tUsLo)
 /** @brief Deck's echoed estimator command-ack sequence */
 LOG_ADD(LOG_UINT8, cmdAck, &cmdAck)
 /** @brief Capture FSM state (0 idle / 1 capturing / 2 ready) */
