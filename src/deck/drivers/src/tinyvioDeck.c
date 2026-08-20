@@ -61,6 +61,10 @@ static uint8_t  fault = 0;        /* Vitals estimator fault byte (0 = healthy)  
 static uint8_t  coherent = 0;     /* last DATA read passed the seqlock            */
 static uint8_t  aliveOk = 0;      /* deck alive_counter is advancing              */
 static float    px = 0, py = 0, pz = 0;  /* position estimate (m)                 */
+/* Orientation, JPL q_GtoI, xyzw — copied verbatim off the wire, no reordering.
+ * Full f32: the deck sends it in DATA, it just was not being logged, so any
+ * Vicon comparison downstream was position-only. */
+static float    qx = 0, qy = 0, qz = 0, qw = 1;
 /* Deck time-of-validity for px/py/pz, split into halves: LogDataGeneric carries
  * values as float32, whose 24-bit mantissa would quantise a u32 us count to
  * ~256 us. Each u16 is exactly representable, so the host gets exact us back
@@ -304,6 +308,7 @@ static void tinyvioTask(void *param) {
      * (This is where a later revision hands (p,v,q) to the estimator/TinyMPC.) */
     if (got_coherent && tinyvio_pose_usable(&st)) {
       px = d.pos[0]; py = d.pos[1]; pz = d.pos[2];
+      qx = d.quat[0]; qy = d.quat[1]; qz = d.quat[2]; qw = d.quat[3];
       /* The deck's own time-of-validity, published alongside the pose it belongs
        * to. Without it the only timestamps downstream are the STM32 log clock
        * (when WE sampled, up to TINYVIO_UPDATE_PERIOD_MS late) and the ROS
@@ -424,6 +429,17 @@ LOG_ADD(LOG_FLOAT, px, &px)
 LOG_ADD(LOG_FLOAT, py, &py)
 /** @brief Position estimate z (m, deck odometry frame) */
 LOG_ADD(LOG_FLOAT, pz, &pz)
+/** @brief Deck orientation, JPL q_GtoI, x component. qx/qy/qz/qw are 16 B and do NOT
+ *  fit alongside px/py/pz + tUs in one 26 B CRTP log payload — give them their own
+ *  block. Both blocks are gated on the same coherence check, so a pose and its
+ *  attitude are from the same frame even though they arrive on separate topics. */
+LOG_ADD(LOG_FLOAT, qx, &qx)
+/** @brief Deck orientation, y. */
+LOG_ADD(LOG_FLOAT, qy, &qy)
+/** @brief Deck orientation, z. */
+LOG_ADD(LOG_FLOAT, qz, &qz)
+/** @brief Deck orientation, w. */
+LOG_ADD(LOG_FLOAT, qw, &qw)
 /** @brief Deck time-of-validity, high half. Reassemble host-side:
  *  t_us = (tUsHi << 16) | tUsLo   (deck us, low 32 bits; wraps ~71.6 min).
  *  Log both halves in the SAME block as px/py/pz — that pairs each pose with the
