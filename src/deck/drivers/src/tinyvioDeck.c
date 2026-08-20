@@ -35,6 +35,7 @@
 #include "log.h"
 #include "param.h"
 #include "i2cdev.h"
+#include "supervisor.h"              /* arm state -> autonomous capture stop   */
 
 #include "tinyvio_deck_protocol.h"   /* vendored from the tiny-vio repo (v0x02) */
 #include "app_channel.h"             /* CF -> host bulk download transport    */
@@ -247,6 +248,21 @@ static void tinyvioTask(void *param) {
      * (and the capture path dead) until a CF reboot. Re-probe at 1 Hz. */
     if (!isVerified && (cycle % 50u) == 0u) {
       probeIdentity();
+    }
+
+    /* Autonomous capture stop on the armed -> disarmed edge (i.e. landed). The deck cannot
+     * detect this itself, and this path does not need the radio: a link loss makes the
+     * supervisor land and disarm, which lands here and freezes the blob. Seeded from the
+     * live arm state so a driver init while already armed does not fire a spurious stop. */
+    {
+      static bool prevArmed = false;
+      static bool armSeeded = false;
+      const bool armedNow = supervisorIsArmed();
+      if (!armSeeded) { prevArmed = armedNow; armSeeded = true; }
+      if (prevArmed && !armedNow && capState == TINYVIO_CAP_CAPTURING) {
+        capCmd = TINYVIO_CAP_CMD_STOP;   /* relayed below, this same pass */
+      }
+      prevArmed = armedNow;
     }
 
     /* Capture blob download (blocking, landed). Runs before the poll cycle. */
