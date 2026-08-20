@@ -250,19 +250,24 @@ static void tinyvioTask(void *param) {
       probeIdentity();
     }
 
-    /* Autonomous capture stop on the armed -> disarmed edge (i.e. landed). The deck cannot
+    /* Autonomous capture stop on the flying -> not-flying edge (i.e. landed). The deck cannot
      * detect this itself, and this path does not need the radio: a link loss makes the
-     * supervisor land and disarm, which lands here and freezes the blob. Seeded from the
-     * live arm state so a driver init while already armed does not fire a spurious stop. */
+     * supervisor land, which lands here and freezes the blob.
+     *
+     * NOT the arm edge. PREFLIGHT_TIMEOUT_MS disarms an armed-but-not-flying drone every 30 s
+     * and AUTO_ARM re-arms it immediately, so on a bench that edge fires forever and truncated
+     * every capture at a random point in the 30 s cycle. isFlying is state-derived with a 2 s
+     * thrust hysteresis, so it never sees those blips. Seeded from the live value so a driver
+     * init mid-flight does not fire a spurious stop. */
     {
-      static bool prevArmed = false;
-      static bool armSeeded = false;
-      const bool armedNow = supervisorIsArmed();
-      if (!armSeeded) { prevArmed = armedNow; armSeeded = true; }
-      if (prevArmed && !armedNow && capState == TINYVIO_CAP_CAPTURING) {
+      static bool prevFlying = false;
+      static bool flySeeded = false;
+      const bool flyingNow = supervisorIsFlying();
+      if (!flySeeded) { prevFlying = flyingNow; flySeeded = true; }
+      if (prevFlying && !flyingNow && capState == TINYVIO_CAP_CAPTURING) {
         capCmd = TINYVIO_CAP_CMD_STOP;   /* relayed below, this same pass */
       }
-      prevArmed = armedNow;
+      prevFlying = flyingNow;
     }
 
     /* Capture blob download (blocking, landed). Runs before the poll cycle. */
