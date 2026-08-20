@@ -62,9 +62,25 @@ static uint8_t  coherent = 0;     /* last DATA read passed the seqlock          
 static uint8_t  aliveOk = 0;      /* deck alive_counter is advancing              */
 static float    px = 0, py = 0, pz = 0;  /* position estimate (m)                 */
 /* Orientation, JPL q_GtoI, xyzw — copied verbatim off the wire, no reordering.
- * Full f32: the deck sends it in DATA, it just was not being logged, so any
- * Vicon comparison downstream was position-only. */
-static float    qx = 0, qy = 0, qz = 0, qw = 1;
+ * i16 at TINYVIO_LOG_QUAT_LSB, so position AND orientation fit ONE log block: a pose
+ * is a position and an orientation, and splitting them across two topics would make
+ * the consumer re-pair them on a timestamp for no reason. DATA still carries full f32
+ * for anything that consumes the pose on-board. */
+static int16_t  qx = 0, qy = 0, qz = 0, qw = 32767;
+/* 1 = this pose passed tinyvio_pose_usable. NOT a statement that the pose is good: the pad
+ * solve is the most precise fix the system ever makes, and on the pad this reads 0.
+ * Nothing consumes it yet (flights are log-only) — it is logged so a recording can tell
+ * "the deck had not reached TRACKING" apart from "the deck stopped producing", which a
+ * frozen pose alone cannot distinguish. */
+static uint8_t  poseUsable = 0;
+
+/* Clamp-then-quantise. A unit component cannot leave [-1,1]; clamping means a NaN or a
+ * denormalised quaternion cannot wrap to a large opposite-signed value on the wire. */
+static int16_t quantQuat(float v) {
+  if (!(v > -1.0f)) return (v != v) ? 0 : -32767;   /* NaN -> 0, <=-1 -> -32767 */
+  if (v >= 1.0f) return 32767;
+  return (int16_t)(v / TINYVIO_LOG_QUAT_LSB + (v >= 0.0f ? 0.5f : -0.5f));
+}
 /* Deck time-of-validity for px/py/pz, split into halves: LogDataGeneric carries
  * values as float32, whose 24-bit mantissa would quantise a u32 us count to
  * ~256 us. Each u16 is exactly representable, so the host gets exact us back
@@ -304,11 +320,24 @@ static void tinyvioTask(void *param) {
     }
     coherent = got_coherent;
 
-    /* Consume the estimate only when coherent AND the deck says it's usable.
-     * (This is where a later revision hands (p,v,q) to the estimator/TinyMPC.) */
-    if (got_coherent && tinyvio_pose_usable(&st)) {
+    /* Two different questions, so two different gates.
+     *
+     * LOGGING only needs the read to be coherent. Withholding the pose until the deck
+     * reaches TRACKING hid the entire boot-to-flight arc from the recording, and made a
+     * pad-pose-vs-Vicon preflight check impossible — the wire was silent until takeoff.
+     * Consumers filter on tinyvio.state, which deckhealth already carries.
+     *
+     * FUSION keeps tinyvio_pose_usable(), and that gate belongs wherever (p,v,q) is
+     * eventually handed to the estimator/TinyMPC, NOT here. Note what it is really
+     * protecting: not the pad, where ZUPT holds the estimate and the solve is the most
+     * precise the system makes, but the window between leaving the pad and the fold gate
+     * releasing — there ZUPT has let go and vision has not taken over, so nothing
+     * constrains the state and it dead-reckons on accel bias. */
+    poseUsable = (got_coherent && tinyvio_pose_usable(&st)) ? 1 : 0;
+    if (got_coherent) {
       px = d.pos[0]; py = d.pos[1]; pz = d.pos[2];
-      qx = d.quat[0]; qy = d.quat[1]; qz = d.quat[2]; qw = d.quat[3];
+      qx = quantQuat(d.quat[0]); qy = quantQuat(d.quat[1]);
+      qz = quantQuat(d.quat[2]); qw = quantQuat(d.quat[3]);
       /* The deck's own time-of-validity, published alongside the pose it belongs
        * to. Without it the only timestamps downstream are the STM32 log clock
        * (when WE sampled, up to TINYVIO_UPDATE_PERIOD_MS late) and the ROS
@@ -429,17 +458,20 @@ LOG_ADD(LOG_FLOAT, px, &px)
 LOG_ADD(LOG_FLOAT, py, &py)
 /** @brief Position estimate z (m, deck odometry frame) */
 LOG_ADD(LOG_FLOAT, pz, &pz)
-/** @brief Deck orientation, JPL q_GtoI, x component. qx/qy/qz/qw are 16 B and do NOT
- *  fit alongside px/py/pz + tUs in one 26 B CRTP log payload — give them their own
- *  block. Both blocks are gated on the same coherence check, so a pose and its
- *  attitude are from the same frame even though they arrive on separate topics. */
-LOG_ADD(LOG_FLOAT, qx, &qx)
-/** @brief Deck orientation, y. */
-LOG_ADD(LOG_FLOAT, qy, &qy)
-/** @brief Deck orientation, z. */
-LOG_ADD(LOG_FLOAT, qz, &qz)
-/** @brief Deck orientation, w. */
-LOG_ADD(LOG_FLOAT, qw, &qw)
+/** @brief Deck orientation, JPL q_GtoI (x,y,z,w), i16 at TINYVIO_LOG_QUAT_LSB.
+ *  Decode host-side: q = value / 32767.0. Logged in the SAME block as px/py/pz so one
+ *  message is one pose — position and orientation, assigned together inside the
+ *  coherence gate, never re-paired downstream on a timestamp. */
+LOG_ADD(LOG_INT16, qx, &qx)
+/** @brief Deck orientation, y. See qx. */
+LOG_ADD(LOG_INT16, qy, &qy)
+/** @brief Deck orientation, z. See qx. */
+LOG_ADD(LOG_INT16, qz, &qz)
+/** @brief Deck orientation, w. See qx. */
+LOG_ADD(LOG_INT16, qw, &qw)
+/** @brief 1 = this pose is corroborated enough to fuse (TRACKING/DEGRADED). The pose is
+ *  logged regardless; this says whether a controller should have believed it. */
+LOG_ADD(LOG_UINT8, poseUsable, &poseUsable)
 /** @brief Deck time-of-validity, high half. Reassemble host-side:
  *  t_us = (tUsHi << 16) | tUsLo   (deck us, low 32 bits; wraps ~71.6 min).
  *  Log both halves in the SAME block as px/py/pz — that pairs each pose with the

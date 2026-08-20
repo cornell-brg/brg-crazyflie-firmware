@@ -313,6 +313,11 @@ typedef struct TINYVIO_PACKED {
 #define TINYVIO_TELEM_STDATT_LSB_RAD   1.0e-5f /* 0.01 mrad; caps ~37.5°          */
 #define TINYVIO_TELEM_BG_LSB_RADS      1.0e-5f /* 0.01 mrad/s; ±327 (rail 100)    */
 #define TINYVIO_TELEM_BA_LSB_MS2       1.0e-4f /* 0.1 mm/s²; ±3.27 (rail 2.0)     */
+/* Orientation quantisation for the CF LOG path ONLY (DATA carries full f32). A unit
+ * quaternion component is in [-1,1], so i16 at this LSB resolves ~0.0035 deg of angle —
+ * 30-70x finer than either the deck's own sigma_att or Vicon. Exists so position AND
+ * orientation fit one 26 B log block: 3xf32 + 4xi16 + 2xu16 = 24 B. */
+#define TINYVIO_LOG_QUAT_LSB           (1.0f / 32767.0f)
 typedef struct TINYVIO_PACKED {
     uint16_t frame_id;       /* +0x00  wraps                                       */
     uint16_t std_pos[3];     /* +0x02  σ position,  LSB TINYVIO_TELEM_STDPOS_LSB_M */
